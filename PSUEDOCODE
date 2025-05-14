@@ -1,0 +1,168 @@
+1) Data Collection with Labels
+import cv2
+import os
+import time
+
+WORDS = ['hello', 'yes', 'no', 'thanks', 'stop']
+FRAMES_PER_WORD = 30
+SAVE_DIR = 'dataset'
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+def collect_data():
+    cap = cv2.VideoCapture(0)
+    for word in WORDS:
+        print(f"Collecting data for: {word}")
+        input("Press Enter when ready...")
+        for i in range(10):  # 10 samples per word
+            frames = []
+            print(f"Recording sample {i+1}...")
+            time.sleep(1)
+            count = 0
+            while count < FRAMES_PER_WORD:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                roi = frame[200:400, 200:400]  # Adjust ROI as needed
+                resized = cv2.resize(roi, (100, 50))
+                frames.append(resized)
+                cv2.rectangle(frame, (200, 200), (400, 400), (0, 255, 0), 2)
+                cv2.imshow("Collecting", frame)
+                count += 1
+                cv2.waitKey(1)
+            save_path = os.path.join(SAVE_DIR, word)
+            os.makedirs(save_path, exist_ok=True)
+            for j, f in enumerate(frames):
+                cv2.imwrite(os.path.join(save_path, f"{i}_{j}.jpg"), f)
+    cap.release()
+    cv2.destroyAllWindows()
+
+collect_data()
+
+2) Preprocessing and Dataset Loader
+import torch
+from torch.utils.data import Dataset
+import glob
+import cv2
+import numpy as np
+import os
+
+class LipDataset(Dataset):
+    def __init__(self, root_dir, words, frames_per_sample=30):
+        self.data = []
+        self.labels = []
+        self.word2idx = {word: i for i, word in enumerate(words)}
+        self.frames_per_sample = frames_per_sample
+
+        for word in words:
+            path = os.path.join(root_dir, word)
+            samples = {}
+            for f in glob.glob(f"{path}/*.jpg"):
+                sample_id = os.path.basename(f).split('_')[0]
+                if sample_id not in samples:
+                    samples[sample_id] = []
+                samples[sample_id].append(f)
+            
+            for s in samples.values():
+                if len(s) == frames_per_sample:
+                    s.sort()
+                    self.data.append(s)
+                    self.labels.append(self.word2idx[word])
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        frames = []
+        for fpath in self.data[idx]:
+            img = cv2.imread(fpath, cv2.IMREAD_GRAYSCALE)
+            img = cv2.resize(img, (100, 50))
+            img = img / 255.0
+            frames.append(img)
+        frames = np.stack(frames)
+        frames = np.expand_dims(frames, axis=1)  # Add channel dim
+        return torch.tensor(frames, dtype=torch.float32), torch.tensor(self.labels[idx])
+
+3) Model (CNN + LSTM)
+import torch.nn as nn
+
+class LipNet(nn.Module):
+    def __init__(self, num_classes):
+        super(LipNet, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=(3,3,3), padding=1),
+            nn.ReLU(),
+            nn.MaxPool3d((1,2,2)),
+            nn.Conv3d(32, 64, kernel_size=(3,3,3), padding=1),
+            nn.ReLU(),
+            nn.MaxPool3d((1,2,2))
+        )
+        self.lstm = nn.LSTM(input_size=64*25*12, hidden_size=128, batch_first=True)
+        self.fc = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.cnn(x)  # B, C, T, H, W
+        x = x.permute(0, 2, 1, 3, 4)  # B, T, C, H, W
+        B, T, C, H, W = x.shape
+        x = x.contiguous().view(B, T, -1)  # B, T, F
+        x, _ = self.lstm(x)
+        x = self.fc(x[:, -1, :])
+        return x
+
+4) Train the Model
+
+from torch.utils.data import DataLoader
+import torch.optim as optim
+
+dataset = LipDataset("dataset", WORDS)
+dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = LipNet(len(WORDS)).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+for epoch in range(10):
+    model.train()
+    running_loss = 0
+    for X, y in dataloader:
+        X, y = X.to(device), y.to(device)
+        X = X.unsqueeze(1)  # Add channel dim for CNN3D
+        optimizer.zero_grad()
+        outputs = model(X)
+        loss = criterion(outputs, y)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    print(f"Epoch {epoch+1}: Loss = {running_loss/len(dataloader)}")
+
+5) Real-Time Inference
+import torch.nn.functional as F
+
+def predict_from_video(model, words):
+    cap = cv2.VideoCapture(0)
+    frames = []
+    print("Start speaking...")
+    while len(frames) < FRAMES_PER_WORD:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        roi = frame[200:400, 200:400]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        resized = cv2.resize(gray, (100, 50))
+        normed = resized / 255.0
+        frames.append(normed)
+        cv2.rectangle(frame, (200, 200), (400, 400), (255, 0, 0), 2)
+        cv2.imshow("Recording", frame)
+        cv2.waitKey(1)
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    if len(frames) == FRAMES_PER_WORD:
+        input_tensor = torch.tensor(frames).unsqueeze(0).unsqueeze(0).float().to(device)
+        with torch.no_grad():
+            logits = model(input_tensor)
+            pred = F.softmax(logits, dim=1)
+            word_idx = torch.argmax(pred, dim=1).item()
+            print(f"Predicted Word: {words[word_idx]}")
